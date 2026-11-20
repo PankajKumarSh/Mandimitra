@@ -1,0 +1,42 @@
+{
+  "name": "mandimitra-ai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MandiMitra AI — आढ़ती का पूरा हिसाब, एक ही जगह।",
+  "workspaces": [
+    "packages/shared",
+    "database",
+    "backend",
+    "frontend"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "db:start": "npm run pg:local -w @mandimitra/database",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:validate": "npm run validate -w @mandimitra/database",
+    "db:generate": "npm run generate -w @mandimitra/database",
+    "db:migrate": "npm run migrate:dev -w @mandimitra/database",
+    "db:deploy": "npm run migrate:deploy -w @mandimitra/database",
+    "db:seed": "npm run seed -w @mandimitra/database",
+    "db:studio": "npm run studio -w @mandimitra/database",
+    "dev:api": "npm run dev -w @mandimitra/backend",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "dev:web": "npm run dev -w @mandimitra/frontend",
+    "build:web": "npm run build -w @mandimitra/frontend",
+    "build:api": "npm run build -w @mandimitra/backend"
+  },
+  "allowScripts": {
+    "@prisma/engines@7.10.1": true,
+    "esbuild@0.28.2": true,
+    "prisma@7.10.1": true,
+    "@embedded-postgres/windows-x64@17.12.0-beta.19": true,
+    "@embedded-postgres/linux-x64@17.12.0-beta.19": true
+  },
+  "overrides": {
+    "effect": "3.22.5"
+  }
+}

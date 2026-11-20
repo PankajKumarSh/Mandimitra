@@ -1,0 +1,18 @@
+import { configureStore } from '@reduxjs/toolkit';
+import { useDispatch, useSelector } from 'react-redux';
+import { api } from '@/services/api';
+import { uiSlice } from './ui-slice';
+
+export function makeStore() {
+  return configureStore({
+    reducer: { ui: uiSlice.reducer, [api.reducerPath]: api.reducer },
+    middleware: (gdm) => gdm().concat(api.middleware),
+  });
+}
+
+export type AppStore = ReturnType<typeof makeStore>;
+export type RootState = ReturnType<AppStore['getState']>;
+export type AppDispatch = AppStore['dispatch'];
+
+export const useAppDispatch = useDispatch.withTypes<AppDispatch>();
+export const useAppSelector = useSelector.withTypes<RootState>();

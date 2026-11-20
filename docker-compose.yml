@@ -1,0 +1,23 @@
+# Local development infrastructure only. Not used in production.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: mandimitra-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mandimitra
+      POSTGRES_PASSWORD: mandimitra_dev
+      POSTGRES_DB: mandimitra
+      TZ: Asia/Kolkata
+    ports:
+      - "5433:5432"
+    volumes:
+      - mandimitra_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mandimitra -d mandimitra"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  mandimitra_pg:

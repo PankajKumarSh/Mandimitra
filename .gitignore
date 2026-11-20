@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.*
+!.env.example
+dist/
+.next/
+coverage/
+database/generated/
+*.log
+.DS_Store
+database/.pgdata/
+frontend/next-env.d.ts
+*.tsbuildinfo
+backend/.uploads/
+.uploads/

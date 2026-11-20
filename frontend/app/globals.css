@@ -1,0 +1,73 @@
+@import 'tailwindcss';
+
+/* MandiMitra design tokens — deep green primary, warm orange accent, light neutral background. */
+@theme {
+  --font-sans: var(--font-inter), var(--font-devanagari), ui-sans-serif, system-ui, sans-serif;
+
+  --color-brand-50: #f0fdf4;
+  --color-brand-100: #dcfce7;
+  --color-brand-200: #bbf7d0;
+  --color-brand-600: #16a34a;
+  --color-brand-700: #15803d;
+  --color-brand-800: #166534;
+  --color-brand-900: #14532d;
+
+  --color-accent-50: #fff7ed;
+  --color-accent-100: #ffedd5;
+  --color-accent-500: #f97316;
+  --color-accent-600: #ea580c;
+  --color-accent-700: #c2410c;
+
+  --color-canvas: #f7f6f3;
+  --color-surface: #ffffff;
+  --color-line: #e7e5e0;
+  --color-ink: #1c1b19;
+  --color-ink-2: #52514e;
+  --color-ink-3: #7a7873;
+
+  --color-danger-50: #fef2f2;
+  --color-danger-600: #dc2626;
+  --color-danger-700: #b91c1c;
+  --color-warn-50: #fffbeb;
+  --color-warn-700: #b45309;
+
+  /* Chart series (validated: CVD ΔE 24.7, all checks pass on light surface) */
+  --color-series-1: #2a78d6;
+  --color-series-2: #eb6834;
+}
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+}
+
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Money & weights: tabular figures so columns of numbers align. */
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-brand-700);
+  outline-offset: 2px;
+}
+
+dialog::backdrop {
+  background: rgb(28 27 25 / 0.45);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

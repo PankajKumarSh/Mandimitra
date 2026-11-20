@@ -1,0 +1,1378 @@
+// =============================================================================
+// MandiMitra AI — PostgreSQL schema (Prisma 7.x)
+//
+// Conventions (see docs/DATABASE.md for rationale):
+//  * PKs are UUIDv7 (time-ordered → good B-tree locality).
+//  * Every tenant-owned row carries `businessId`.
+//  * Required references between tenant rows use COMPOSITE FKs
+//    (businessId, id) so the database itself rejects cross-tenant links.
+//  * Money  = Decimal(14,2)  (₹, 2 dp)       — never Float.
+//  * Weight = Decimal(14,3)  (always stored in KG, the canonical unit).
+//  * Rate   = Decimal(12,2)  per `rateUnit` (usually QUINTAL).
+//  * Ledger entries are append-only; corrections are reversal entries.
+//  * CHECK constraints not expressible in Prisma live in the migration SQL.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
+
+enum Language {
+  HI
+  EN
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum BusinessStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum MembershipStatus {
+  INVITED
+  ACTIVE
+  DEACTIVATED
+}
+
+enum TradingMode {
+  COMMISSION_AGENT // aadhati sells farmer's produce to buyer; purchase rate = auction rate
+  TRADER // business buys from farmer and resells at its own rate
+  MIXED
+}
+
+enum NetRounding {
+  NONE
+  NEAREST_RUPEE
+}
+
+enum PattiLanguage {
+  HI
+  EN
+  BILINGUAL
+}
+
+enum QuantityUnit {
+  KG
+  QUINTAL
+  TON
+  BAG
+}
+
+enum LotStatus {
+  DRAFT
+  CONFIRMED
+  PARTIALLY_SOLD
+  SOLD
+  CANCELLED
+}
+
+enum TxnStatus {
+  ACTIVE
+  CANCELLED
+}
+
+enum PattiStatus {
+  DRAFT
+  FINALIZED
+  CANCELLED
+}
+
+enum ChargeType {
+  COMMISSION
+  LABOUR
+  WEIGHING
+  TRANSPORT
+  MARKET_FEE
+  LOADING_UNLOADING
+  OTHER
+}
+
+enum CalcMethod {
+  PERCENTAGE // value is % of gross amount
+  FIXED // flat ₹ per transaction / patti
+  PER_QUINTAL // ₹ per quintal of net weight
+  PER_KG
+  PER_BAG
+}
+
+enum PartySide {
+  FARMER
+  BUYER
+}
+
+enum LedgerEntryType {
+  OPENING_BALANCE
+  PATTI_CREDIT // farmer: net patti amount credited
+  SALE_DEBIT // buyer: sale invoice debited
+  ADVANCE // farmer: advance paid
+  PAYMENT // farmer: settlement paid / buyer: collection received
+  ADJUSTMENT // owner-approved manual adjustment
+  REVERSAL // reverses another entry (cancellation)
+}
+
+enum PaymentDirection {
+  OUTGOING // business → farmer
+  INCOMING // buyer → business
+}
+
+enum PaymentPurpose {
+  ADVANCE
+  SETTLEMENT
+  COLLECTION
+  REFUND
+  OTHER
+}
+
+enum PaymentMode {
+  CASH
+  UPI
+  BANK_TRANSFER
+  CHEQUE
+}
+
+enum DocType {
+  FARMER
+  BUYER
+  LOT
+  PURCHASE
+  SALE
+  PATTI
+  PAYMENT
+  EXPENSE
+}
+
+enum ApprovalAction {
+  CANCEL
+  EDIT
+  LEDGER_ADJUSTMENT
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  CANCEL
+  CONFIRM
+  FINALIZE
+  APPROVE
+  REJECT
+  RESTORE
+}
+
+enum ActivityType {
+  LOGIN_SUCCESS
+  LOGIN_FAILED
+  LOGOUT
+  TOKEN_REUSE_DETECTED
+  PASSWORD_CHANGED
+  BUSINESS_SWITCHED
+  REPORT_EXPORTED
+  STATEMENT_SHARED
+  BANK_DETAILS_VIEWED
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+  EXPIRED
+  SUSPENDED
+}
+
+enum BillingPaymentStatus {
+  CREATED
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum ConsentStatus {
+  UNKNOWN
+  OPTED_IN
+  OPTED_OUT
+}
+
+enum MessageStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+enum AttachmentPurpose {
+  PATTI_PDF
+  STATEMENT_PDF
+  RECEIPT_PDF
+  EXPENSE_BILL
+  AI_UPLOAD
+  LOGO
+  EXPORT
+}
+
+enum AiRole {
+  USER
+  ASSISTANT
+  TOOL
+}
+
+enum AiInputMode {
+  TEXT
+  VOICE
+  IMAGE
+}
+
+enum AiDraftType {
+  FARMER
+  LOT
+  PURCHASE
+  SALE
+  PAYMENT
+  EXPENSE
+}
+
+enum AiDraftStatus {
+  PENDING
+  CONFIRMED
+  DISCARDED
+  EXPIRED
+}
+
+// -----------------------------------------------------------------------------
+// IDENTITY, AUTH, TENANCY
+// -----------------------------------------------------------------------------
+
+model User {
+  id                String     @id @default(uuid(7)) @db.Uuid
+  fullName          String     @db.VarChar(120)
+  mobile            String     @unique @db.VarChar(15) // E.164, e.g. +919812345678
+  email             String?    @unique @db.VarChar(254)
+  passwordHash      String // argon2id
+  isPlatformAdmin   Boolean    @default(false) // Super Admin (platform scope, no tenant)
+  preferredLanguage Language   @default(HI)
+  status            UserStatus @default(ACTIVE)
+  failedLoginCount  Int        @default(0)
+  lockedUntil       DateTime?  @db.Timestamptz(3)
+  lastLoginAt       DateTime?  @db.Timestamptz(3)
+  createdAt         DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime   @updatedAt @db.Timestamptz(3)
+
+  memberships     BusinessMembership[]
+  refreshTokens   RefreshToken[]
+  ownedBusinesses Business[]           @relation("BusinessOwner")
+  invitesSent     StaffInvite[]        @relation("InviteSender")
+  activities      StaffActivity[]
+  auditLogs       AuditLog[]
+  notifications   Notification[]
+  aiConversations AiConversation[]
+  aiDrafts        AiDraft[]            @relation("AiDraftOwner")
+
+  farmersCreated     Farmer[]            @relation("FarmerCreatedBy")
+  buyersCreated      Buyer[]             @relation("BuyerCreatedBy")
+  lotsCreated        Lot[]               @relation("LotCreatedBy")
+  purchasesCreated   Purchase[]          @relation("PurchaseCreatedBy")
+  salesCreated       Sale[]              @relation("SaleCreatedBy")
+  pattisCreated      Patti[]             @relation("PattiCreatedBy")
+  pattisFinalized    Patti[]             @relation("PattiFinalizedBy")
+  paymentsCreated    Payment[]           @relation("PaymentCreatedBy")
+  expensesCreated    Expense[]           @relation("ExpenseCreatedBy")
+  farmerLedgerPosted FarmerLedgerEntry[] @relation("FarmerLedgerCreatedBy")
+  buyerLedgerPosted  BuyerLedgerEntry[]  @relation("BuyerLedgerCreatedBy")
+  approvalsRequested ApprovalRequest[]   @relation("ApprovalRequestedBy")
+  approvalsDecided   ApprovalRequest[]   @relation("ApprovalDecidedBy")
+  attachments        Attachment[]
+  whatsappMessages   WhatsAppMessage[]
+
+  @@index([status])
+}
+
+model RefreshToken {
+  id           String    @id @default(uuid(7)) @db.Uuid
+  userId       String    @db.Uuid
+  businessId   String?   @db.Uuid // active business at issue time
+  tokenHash    String    @unique // SHA-256 of the opaque token; raw token never stored
+  familyId     String    @db.Uuid // rotation family; reuse of a rotated token revokes the family
+  expiresAt    DateTime  @db.Timestamptz(3)
+  revokedAt    DateTime? @db.Timestamptz(3)
+  replacedById String?   @db.Uuid
+  userAgent    String?   @db.VarChar(300)
+  ipAddress    String?   @db.VarChar(45)
+  createdAt    DateTime  @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+}
+
+model Business {
+  id            String         @id @default(uuid(7)) @db.Uuid
+  name          String         @db.VarChar(150)
+  nameHindi     String?        @db.VarChar(150)
+  ownerUserId   String         @db.Uuid
+  mandiName     String?        @db.VarChar(150)
+  licenseNumber String?        @db.VarChar(60) // APMC licence
+  gstin         String?        @db.VarChar(15)
+  phone         String?        @db.VarChar(15)
+  email         String?        @db.VarChar(254)
+  addressLine   String?        @db.VarChar(300)
+  city          String?        @db.VarChar(80)
+  district      String?        @db.VarChar(80)
+  state         String?        @db.VarChar(80)
+  pincode       String?        @db.VarChar(6)
+  logoId        String?        @db.Uuid
+  status        BusinessStatus @default(ACTIVE)
+  suspendedAt   DateTime?      @db.Timestamptz(3)
+  suspendReason String?
+  createdAt     DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime       @updatedAt @db.Timestamptz(3)
+
+  owner            User                 @relation("BusinessOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  settings         BusinessSettings?
+  memberships      BusinessMembership[]
+  invites          StaffInvite[]
+  customRoles      Role[]
+  farmers          Farmer[]
+  farmerBanks      FarmerBankAccount[]
+  buyers           Buyer[]
+  commodities      Commodity[]
+  grades           CommodityGrade[]
+  lots             Lot[]
+  purchases        Purchase[]
+  sales            Sale[]
+  saleCharges      SaleCharge[]
+  commissionRules  CommissionRule[]
+  pattis           Patti[]
+  deductions       Deduction[]
+  farmerLedger     FarmerLedgerEntry[]
+  buyerLedger      BuyerLedgerEntry[]
+  payments         Payment[]
+  expenseCats      ExpenseCategory[]
+  expenses         Expense[]
+  sequences        DocumentSequence[]
+  idempotency      IdempotencyRecord[]
+  approvals        ApprovalRequest[]
+  auditLogs        AuditLog[]
+  activities       StaffActivity[]
+  subscription     Subscription?
+  subEvents        SubscriptionEvent[]
+  billingPayments  BillingPayment[]
+  notifications    Notification[]
+  whatsappMessages WhatsAppMessage[]
+  attachments      Attachment[]
+  aiConversations  AiConversation[]
+  aiMessages       AiMessage[]
+  aiDrafts         AiDraft[]
+
+  @@index([status])
+  @@index([ownerUserId])
+}
+
+model BusinessSettings {
+  businessId                String        @id @db.Uuid
+  tradingMode               TradingMode   @default(COMMISSION_AGENT)
+  defaultRateUnit           QuantityUnit  @default(QUINTAL)
+  fiscalYearStartMonth      Int           @default(4) // April (Indian FY)
+  netRounding               NetRounding   @default(NEAREST_RUPEE)
+  pattiLanguage             PattiLanguage @default(BILINGUAL)
+  pattiFooterNote           String?       @db.VarChar(500)
+  requireApprovalForCancel  Boolean       @default(true) // munim cancellations need owner approval
+  allowNegativeFarmerBalance Boolean      @default(true) // advances may exceed payable
+  autoAdjustAdvanceInPatti  Boolean       @default(true)
+  updatedAt                 DateTime      @updatedAt @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+}
+
+/// System roles have businessId = null (OWNER, MUNIM, VIEWER). Businesses may add custom roles.
+model Role {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  businessId  String?  @db.Uuid
+  key         String   @db.VarChar(50)
+  name        String   @db.VarChar(80)
+  nameHindi   String?  @db.VarChar(80)
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  business    Business?            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  permissions RolePermission[]
+  memberships BusinessMembership[]
+  invites     StaffInvite[]
+
+  @@unique([businessId, key])
+}
+
+model Permission {
+  id          String @id @default(uuid(7)) @db.Uuid
+  key         String @unique @db.VarChar(80) // e.g. "payment:create"
+  module      String @db.VarChar(40)
+  description String @db.VarChar(200)
+
+  roles RolePermission[]
+}
+
+model RolePermission {
+  roleId       String @db.Uuid
+  permissionId String @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+model BusinessMembership {
+  id            String           @id @default(uuid(7)) @db.Uuid
+  businessId    String           @db.Uuid
+  userId        String           @db.Uuid
+  roleId        String           @db.Uuid
+  status        MembershipStatus @default(ACTIVE)
+  joinedAt      DateTime?        @db.Timestamptz(3)
+  deactivatedAt DateTime?        @db.Timestamptz(3)
+  createdAt     DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime         @updatedAt @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role     Role     @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@unique([businessId, userId])
+  @@index([userId])
+}
+
+model StaffInvite {
+  id          String    @id @default(uuid(7)) @db.Uuid
+  businessId  String    @db.Uuid
+  mobile      String    @db.VarChar(15)
+  fullName    String?   @db.VarChar(120)
+  roleId      String    @db.Uuid
+  tokenHash   String    @unique
+  invitedById String    @db.Uuid
+  expiresAt   DateTime  @db.Timestamptz(3)
+  acceptedAt  DateTime? @db.Timestamptz(3)
+  revokedAt   DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+
+  business  Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  invitedBy User     @relation("InviteSender", fields: [invitedById], references: [id], onDelete: Restrict)
+
+  @@index([businessId, mobile])
+}
+
+// -----------------------------------------------------------------------------
+// MASTERS: FARMERS, BUYERS, COMMODITIES
+// -----------------------------------------------------------------------------
+
+model Farmer {
+  id                String        @id @default(uuid(7)) @db.Uuid
+  businessId        String        @db.Uuid
+  code              String        @db.VarChar(20) // auto-generated, e.g. F-00042
+  name              String        @db.VarChar(120)
+  nameHindi         String?       @db.VarChar(120)
+  fatherName        String?       @db.VarChar(120) // पिता का नाम — common identifier in mandi registers
+  mobile            String?       @db.VarChar(15)
+  village           String?       @db.VarChar(100)
+  tehsil            String?       @db.VarChar(100)
+  district          String?       @db.VarChar(100)
+  state             String?       @db.VarChar(80)
+  address           String?       @db.VarChar(300)
+  notes             String?
+  registeredAt      DateTime      @default(now()) @db.Timestamptz(3)
+  openingBalance    Decimal       @default(0) @db.Decimal(14, 2) // +ve = business owes farmer
+  currentBalance    Decimal       @default(0) @db.Decimal(14, 2) // cached; source of truth = ledger
+  whatsappConsent   ConsentStatus @default(UNKNOWN)
+  whatsappConsentAt DateTime?     @db.Timestamptz(3)
+  isActive          Boolean       @default(true)
+  deletedAt         DateTime?     @db.Timestamptz(3) // soft delete (masters only)
+  createdById       String        @db.Uuid
+  createdAt         DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime      @updatedAt @db.Timestamptz(3)
+
+  business     Business            @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  createdBy    User                @relation("FarmerCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  bankAccounts FarmerBankAccount[]
+  lots         Lot[]
+  purchases    Purchase[]
+  pattis       Patti[]
+  ledger       FarmerLedgerEntry[]
+  payments     Payment[]
+  messages     WhatsAppMessage[]
+
+  @@unique([businessId, id]) // target for composite tenant FKs
+  @@unique([businessId, code])
+  @@index([businessId, name])
+  @@index([businessId, mobile])
+  @@index([businessId, village])
+}
+
+/// Account number is encrypted at the application layer (AES-256-GCM); only last 4 digits are stored in clear.
+model FarmerBankAccount {
+  id                String   @id @default(uuid(7)) @db.Uuid
+  businessId        String   @db.Uuid
+  farmerId          String   @db.Uuid
+  accountHolderName String   @db.VarChar(120)
+  accountNumberEnc  String // base64(iv|ciphertext|tag)
+  accountNumberLast4 String  @db.VarChar(4)
+  ifsc              String?  @db.VarChar(11)
+  bankName          String?  @db.VarChar(120)
+  upiId             String?  @db.VarChar(100)
+  isPrimary         Boolean  @default(false)
+  createdAt         DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime @updatedAt @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  farmer   Farmer   @relation(fields: [businessId, farmerId], references: [businessId, id], onDelete: Cascade)
+
+  @@index([businessId, farmerId])
+}
+
+model Buyer {
+  id                String        @id @default(uuid(7)) @db.Uuid
+  businessId        String        @db.Uuid
+  code              String        @db.VarChar(20) // e.g. B-00007
+  firmName          String        @db.VarChar(150)
+  ownerName         String?       @db.VarChar(120)
+  mobile            String?       @db.VarChar(15)
+  address           String?       @db.VarChar(300)
+  city              String?       @db.VarChar(100)
+  gstin             String?       @db.VarChar(15)
+  openingBalance    Decimal       @default(0) @db.Decimal(14, 2) // +ve = buyer owes business
+  currentBalance    Decimal       @default(0) @db.Decimal(14, 2) // cached receivable
+  creditLimit       Decimal?      @db.Decimal(14, 2)
+  notes             String?
+  whatsappConsent   ConsentStatus @default(UNKNOWN)
+  whatsappConsentAt DateTime?     @db.Timestamptz(3)
+  isActive          Boolean       @default(true)
+  deletedAt         DateTime?     @db.Timestamptz(3)
+  createdById       String        @db.Uuid
+  createdAt         DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime      @updatedAt @db.Timestamptz(3)
+
+  business  Business           @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  createdBy User               @relation("BuyerCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  sales     Sale[]
+  ledger    BuyerLedgerEntry[]
+  payments  Payment[]
+  messages  WhatsAppMessage[]
+
+  @@unique([businessId, id])
+  @@unique([businessId, code])
+  @@index([businessId, firmName])
+  @@index([businessId, mobile])
+}
+
+model Commodity {
+  id           String       @id @default(uuid(7)) @db.Uuid
+  businessId   String       @db.Uuid
+  name         String       @db.VarChar(80) // "Wheat"
+  nameHindi    String?      @db.VarChar(80) // "गेहूं"
+  defaultUnit  QuantityUnit @default(QUINTAL) // unit for entry/display
+  rateUnit     QuantityUnit @default(QUINTAL) // rate is quoted "per" this unit
+  bagWeightKg  Decimal?     @db.Decimal(8, 3) // required when BAG unit is used
+  isActive     Boolean      @default(true)
+  sortOrder    Int          @default(0)
+  createdAt    DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime     @updatedAt @db.Timestamptz(3)
+
+  business        Business         @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  grades          CommodityGrade[]
+  lots            Lot[]
+  purchases       Purchase[]
+  sales           Sale[]
+  commissionRules CommissionRule[]
+
+  @@unique([businessId, id])
+  @@unique([businessId, name])
+}
+
+model CommodityGrade {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  businessId  String   @db.Uuid
+  commodityId String   @db.Uuid
+  name        String   @db.VarChar(50) // "A", "FAQ", "Sharbati"
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  business  Business  @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  commodity Commodity @relation(fields: [businessId, commodityId], references: [businessId, id], onDelete: Cascade)
+  lots      Lot[]
+
+  @@unique([commodityId, name])
+}
+
+// -----------------------------------------------------------------------------
+// OPERATIONS: LOTS, PURCHASES, SALES
+// -----------------------------------------------------------------------------
+
+model Lot {
+  id                String    @id @default(uuid(7)) @db.Uuid
+  businessId        String    @db.Uuid
+  lotNumber         String    @db.VarChar(30) // e.g. L/2026-27/000123
+  farmerId          String    @db.Uuid
+  commodityId       String    @db.Uuid
+  gradeId           String?   @db.Uuid
+  arrivalDate       DateTime  @db.Date
+  vehicleNumber     String?   @db.VarChar(20)
+  bags              Int       @default(0)
+  grossWeightKg     Decimal   @db.Decimal(14, 3)
+  tareWeightKg      Decimal   @default(0) @db.Decimal(14, 3)
+  netWeightKg       Decimal   @db.Decimal(14, 3) // = gross − tare, computed by backend; CHECKed in DB
+  moisturePercent   Decimal?  @db.Decimal(5, 2)
+  soldWeightKg      Decimal   @default(0) @db.Decimal(14, 3) // Σ active sales; CHECK sold ≤ net
+  purchasedWeightKg Decimal   @default(0) @db.Decimal(14, 3) // Σ active purchases; CHECK purchased ≤ net
+  status            LotStatus @default(DRAFT)
+  remarks           String?
+  confirmedAt       DateTime? @db.Timestamptz(3)
+  cancelledAt       DateTime? @db.Timestamptz(3)
+  cancelReason      String?
+  version           Int       @default(0) // optimistic concurrency
+  createdById       String    @db.Uuid
+  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @db.Timestamptz(3)
+
+  business  Business        @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  farmer    Farmer          @relation(fields: [businessId, farmerId], references: [businessId, id], onDelete: Restrict)
+  commodity Commodity       @relation(fields: [businessId, commodityId], references: [businessId, id], onDelete: Restrict)
+  grade     CommodityGrade? @relation(fields: [gradeId], references: [id], onDelete: SetNull)
+  createdBy User            @relation("LotCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  purchases Purchase[]
+  sales     Sale[]
+
+  @@unique([businessId, id])
+  @@unique([businessId, lotNumber])
+  @@index([businessId, arrivalDate])
+  @@index([businessId, status])
+  @@index([businessId, farmerId])
+  @@index([businessId, commodityId, arrivalDate])
+}
+
+/// Farmer side of a deal: what the business owes the farmer for (part of) a lot.
+model Purchase {
+  id             String       @id @default(uuid(7)) @db.Uuid
+  businessId     String       @db.Uuid
+  purchaseNumber String       @db.VarChar(30)
+  farmerId       String       @db.Uuid
+  lotId          String       @db.Uuid
+  commodityId    String       @db.Uuid
+  saleId         String?      @unique @db.Uuid // set when auto-created from a sale in COMMISSION_AGENT mode
+  pattiId        String?      @db.Uuid // set once included in a patti
+  purchaseDate   DateTime     @db.Date
+  weightKg       Decimal      @db.Decimal(14, 3)
+  bags           Int          @default(0)
+  rate           Decimal      @db.Decimal(12, 2)
+  rateUnit       QuantityUnit @default(QUINTAL)
+  grossAmount    Decimal      @db.Decimal(14, 2)
+  status         TxnStatus    @default(ACTIVE)
+  cancelledAt    DateTime?    @db.Timestamptz(3)
+  cancelReason   String?
+  createdById    String       @db.Uuid
+  createdAt      DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime     @updatedAt @db.Timestamptz(3)
+
+  business  Business  @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  farmer    Farmer    @relation(fields: [businessId, farmerId], references: [businessId, id], onDelete: Restrict)
+  lot       Lot       @relation(fields: [businessId, lotId], references: [businessId, id], onDelete: Restrict)
+  commodity Commodity @relation(fields: [businessId, commodityId], references: [businessId, id], onDelete: Restrict)
+  sale      Sale?     @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  patti     Patti?    @relation(fields: [pattiId], references: [id], onDelete: SetNull)
+  createdBy User      @relation("PurchaseCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([businessId, purchaseNumber])
+  @@index([businessId, purchaseDate])
+  @@index([businessId, farmerId, status])
+  @@index([businessId, lotId])
+  @@index([pattiId])
+}
+
+/// Buyer side of a deal. Multiple sales per lot = partial lot sales to multiple buyers.
+model Sale {
+  id           String       @id @default(uuid(7)) @db.Uuid
+  businessId   String       @db.Uuid
+  saleNumber   String       @db.VarChar(30)
+  buyerId      String       @db.Uuid
+  lotId        String       @db.Uuid
+  commodityId  String       @db.Uuid
+  saleDate     DateTime     @db.Date
+  weightKg     Decimal      @db.Decimal(14, 3)
+  bags         Int          @default(0)
+  rate         Decimal      @db.Decimal(12, 2)
+  rateUnit     QuantityUnit @default(QUINTAL)
+  grossAmount  Decimal      @db.Decimal(14, 2)
+  chargesTotal Decimal      @default(0) @db.Decimal(14, 2) // buyer-side charges (if business config charges buyer)
+  totalAmount  Decimal      @db.Decimal(14, 2) // gross + charges → debited to buyer ledger
+  status       TxnStatus    @default(ACTIVE)
+  cancelledAt  DateTime?    @db.Timestamptz(3)
+  cancelReason String?
+  createdById  String       @db.Uuid
+  createdAt    DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime     @updatedAt @db.Timestamptz(3)
+
+  business  Business           @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  buyer     Buyer              @relation(fields: [businessId, buyerId], references: [businessId, id], onDelete: Restrict)
+  lot       Lot                @relation(fields: [businessId, lotId], references: [businessId, id], onDelete: Restrict)
+  commodity Commodity          @relation(fields: [businessId, commodityId], references: [businessId, id], onDelete: Restrict)
+  createdBy User               @relation("SaleCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  charges   SaleCharge[]
+  purchase  Purchase?
+  ledger    BuyerLedgerEntry[]
+
+  @@unique([businessId, id])
+  @@unique([businessId, saleNumber])
+  @@index([businessId, saleDate])
+  @@index([businessId, buyerId, status])
+  @@index([businessId, lotId])
+}
+
+model SaleCharge {
+  id               String     @id @default(uuid(7)) @db.Uuid
+  businessId       String     @db.Uuid
+  saleId           String     @db.Uuid
+  commissionRuleId String?    @db.Uuid
+  chargeType       ChargeType
+  calcMethod       CalcMethod
+  rateValue        Decimal    @db.Decimal(12, 4) // snapshot of rule value at time of sale
+  baseValue        Decimal    @db.Decimal(16, 3) // amount or weight the rate applied to
+  amount           Decimal    @db.Decimal(14, 2)
+  label            String     @db.VarChar(80)
+  isManual         Boolean    @default(false)
+  sortOrder        Int        @default(0)
+
+  business Business        @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  sale     Sale            @relation(fields: [businessId, saleId], references: [businessId, id], onDelete: Cascade)
+  rule     CommissionRule? @relation(fields: [commissionRuleId], references: [id], onDelete: SetNull)
+
+  @@index([businessId, saleId])
+}
+
+// -----------------------------------------------------------------------------
+// SETTLEMENT: COMMISSION RULES, PATTI, DEDUCTIONS
+// -----------------------------------------------------------------------------
+
+/// Business-configured charge rule. Snapshotted into Deduction / SaleCharge rows when applied,
+/// so editing a rule never changes historical pattis.
+model CommissionRule {
+  id            String     @id @default(uuid(7)) @db.Uuid
+  businessId    String     @db.Uuid
+  name          String     @db.VarChar(80)
+  nameHindi     String?    @db.VarChar(80)
+  chargeType    ChargeType
+  calcMethod    CalcMethod
+  value         Decimal    @db.Decimal(12, 4) // % for PERCENTAGE, ₹ otherwise
+  appliesTo     PartySide  @default(FARMER)
+  commodityId   String?    @db.Uuid // null = applies to all commodities
+  priority      Int        @default(0) // commodity-specific rule overrides generic rule of same chargeType
+  isActive      Boolean    @default(true)
+  effectiveFrom DateTime   @db.Date
+  effectiveTo   DateTime?  @db.Date
+  createdAt     DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime   @updatedAt @db.Timestamptz(3)
+
+  business    Business     @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  commodity   Commodity?   @relation(fields: [commodityId], references: [id], onDelete: Restrict)
+  deductions  Deduction[]
+  saleCharges SaleCharge[]
+
+  @@index([businessId, isActive, appliesTo])
+  @@index([businessId, commodityId])
+}
+
+model Patti {
+  id              String      @id @default(uuid(7)) @db.Uuid
+  businessId      String      @db.Uuid
+  pattiNumber     String      @db.VarChar(30)
+  farmerId        String      @db.Uuid
+  pattiDate       DateTime    @db.Date
+  status          PattiStatus @default(DRAFT)
+  totalWeightKg   Decimal     @default(0) @db.Decimal(14, 3)
+  totalBags       Int         @default(0)
+  grossAmount     Decimal     @default(0) @db.Decimal(14, 2)
+  totalDeductions Decimal     @default(0) @db.Decimal(14, 2)
+  netAmount       Decimal     @default(0) @db.Decimal(14, 2) // gross − deductions (credited to ledger)
+  advanceAdjusted Decimal     @default(0) @db.Decimal(14, 2) // informational: outstanding advance netted off
+  roundOff        Decimal     @default(0) @db.Decimal(6, 2)
+  netPayable      Decimal     @default(0) @db.Decimal(14, 2) // amount shown as payable on the slip
+  farmerSnapshot  Json? // name/village/mobile frozen at finalization
+  businessSnapshot Json? // name/address/licence frozen at finalization
+  notes           String?
+  finalizedAt     DateTime?   @db.Timestamptz(3)
+  finalizedById   String?     @db.Uuid
+  cancelledAt     DateTime?   @db.Timestamptz(3)
+  cancelReason    String?
+  pdfId           String?     @db.Uuid
+  version         Int         @default(0)
+  createdById     String      @db.Uuid
+  createdAt       DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime    @updatedAt @db.Timestamptz(3)
+
+  business    Business            @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  farmer      Farmer              @relation(fields: [businessId, farmerId], references: [businessId, id], onDelete: Restrict)
+  createdBy   User                @relation("PattiCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  finalizedBy User?               @relation("PattiFinalizedBy", fields: [finalizedById], references: [id], onDelete: Restrict)
+  pdf         Attachment?         @relation(fields: [pdfId], references: [id], onDelete: SetNull)
+  purchases   Purchase[]
+  deductions  Deduction[]
+  ledger      FarmerLedgerEntry[]
+
+  @@unique([businessId, id])
+  @@unique([businessId, pattiNumber])
+  @@index([businessId, pattiDate])
+  @@index([businessId, farmerId, status])
+}
+
+/// Farmer-side deduction line on a patti (commission, labour, weighing …). Immutable after finalization.
+model Deduction {
+  id               String     @id @default(uuid(7)) @db.Uuid
+  businessId       String     @db.Uuid
+  pattiId          String     @db.Uuid
+  commissionRuleId String?    @db.Uuid
+  chargeType       ChargeType
+  calcMethod       CalcMethod
+  rateValue        Decimal    @db.Decimal(12, 4)
+  baseValue        Decimal    @db.Decimal(16, 3)
+  amount           Decimal    @db.Decimal(14, 2)
+  label            String     @db.VarChar(80)
+  labelHindi       String?    @db.VarChar(80)
+  isManual         Boolean    @default(false)
+  sortOrder        Int        @default(0)
+
+  business Business        @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  patti    Patti           @relation(fields: [businessId, pattiId], references: [businessId, id], onDelete: Cascade)
+  rule     CommissionRule? @relation(fields: [commissionRuleId], references: [id], onDelete: SetNull)
+
+  @@index([businessId, pattiId])
+}
+
+// -----------------------------------------------------------------------------
+// LEDGERS & PAYMENTS
+// -----------------------------------------------------------------------------
+
+/// Append-only. balance = Σcredit − Σdebit (+ve ⇒ business owes farmer).
+model FarmerLedgerEntry {
+  id           String          @id @default(uuid(7)) @db.Uuid
+  seq          BigInt          @default(autoincrement()) // stable ordering for running balance
+  businessId   String          @db.Uuid
+  farmerId     String          @db.Uuid
+  entryDate    DateTime        @db.Date
+  entryType    LedgerEntryType
+  debit        Decimal         @default(0) @db.Decimal(14, 2)
+  credit       Decimal         @default(0) @db.Decimal(14, 2)
+  balanceAfter Decimal         @db.Decimal(14, 2) // written under row lock on Farmer
+  narration    String          @db.VarChar(300)
+  pattiId      String?         @db.Uuid
+  paymentId    String?         @db.Uuid
+  reversalOfId String?         @unique @db.Uuid
+  createdById  String          @db.Uuid
+  createdAt    DateTime        @default(now()) @db.Timestamptz(3)
+
+  business   Business           @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  farmer     Farmer             @relation(fields: [businessId, farmerId], references: [businessId, id], onDelete: Restrict)
+  patti      Patti?             @relation(fields: [pattiId], references: [id], onDelete: Restrict)
+  payment    Payment?           @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  reversalOf FarmerLedgerEntry? @relation("FarmerLedgerReversal", fields: [reversalOfId], references: [id], onDelete: Restrict)
+  reversedBy FarmerLedgerEntry? @relation("FarmerLedgerReversal")
+  createdBy  User               @relation("FarmerLedgerCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([businessId, farmerId, seq])
+  @@index([businessId, entryDate])
+}
+
+/// Append-only. balance = Σdebit − Σcredit (+ve ⇒ buyer owes business).
+model BuyerLedgerEntry {
+  id           String          @id @default(uuid(7)) @db.Uuid
+  seq          BigInt          @default(autoincrement())
+  businessId   String          @db.Uuid
+  buyerId      String          @db.Uuid
+  entryDate    DateTime        @db.Date
+  entryType    LedgerEntryType
+  debit        Decimal         @default(0) @db.Decimal(14, 2)
+  credit       Decimal         @default(0) @db.Decimal(14, 2)
+  balanceAfter Decimal         @db.Decimal(14, 2)
+  narration    String          @db.VarChar(300)
+  saleId       String?         @db.Uuid
+  paymentId    String?         @db.Uuid
+  reversalOfId String?         @unique @db.Uuid
+  createdById  String          @db.Uuid
+  createdAt    DateTime        @default(now()) @db.Timestamptz(3)
+
+  business   Business          @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  buyer      Buyer             @relation(fields: [businessId, buyerId], references: [businessId, id], onDelete: Restrict)
+  sale       Sale?             @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  payment    Payment?          @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  reversalOf BuyerLedgerEntry? @relation("BuyerLedgerReversal", fields: [reversalOfId], references: [id], onDelete: Restrict)
+  reversedBy BuyerLedgerEntry? @relation("BuyerLedgerReversal")
+  createdBy  User              @relation("BuyerLedgerCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([businessId, buyerId, seq])
+  @@index([businessId, entryDate])
+}
+
+model Payment {
+  id              String           @id @default(uuid(7)) @db.Uuid
+  businessId      String           @db.Uuid
+  receiptNumber   String           @db.VarChar(30)
+  partySide       PartySide
+  farmerId        String?          @db.Uuid // exactly one of farmerId / buyerId (CHECK)
+  buyerId         String?          @db.Uuid
+  direction       PaymentDirection
+  purpose         PaymentPurpose
+  mode            PaymentMode
+  referenceNumber String?          @db.VarChar(60) // UTR / UPI ref / cheque no.
+  amount          Decimal          @db.Decimal(14, 2) // CHECK > 0
+  paymentDate     DateTime         @db.Date
+  remarks         String?          @db.VarChar(300)
+  idempotencyKey  String           @db.VarChar(64) // client-generated; prevents double submission
+  status          TxnStatus        @default(ACTIVE)
+  cancelledAt     DateTime?        @db.Timestamptz(3)
+  cancelReason    String?
+  receiptPdfId    String?          @db.Uuid
+  createdById     String           @db.Uuid
+  createdAt       DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime         @updatedAt @db.Timestamptz(3)
+
+  business     Business            @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  farmer       Farmer?             @relation(fields: [farmerId], references: [id], onDelete: Restrict)
+  buyer        Buyer?              @relation(fields: [buyerId], references: [id], onDelete: Restrict)
+  receiptPdf   Attachment?         @relation(fields: [receiptPdfId], references: [id], onDelete: SetNull)
+  createdBy    User                @relation("PaymentCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  farmerLedger FarmerLedgerEntry[]
+  buyerLedger  BuyerLedgerEntry[]
+
+  @@unique([businessId, receiptNumber])
+  @@unique([businessId, idempotencyKey])
+  @@index([businessId, paymentDate])
+  @@index([businessId, farmerId])
+  @@index([businessId, buyerId])
+  @@index([businessId, mode, referenceNumber]) // duplicate-reference warning lookup
+}
+
+// -----------------------------------------------------------------------------
+// EXPENSES
+// -----------------------------------------------------------------------------
+
+model ExpenseCategory {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  businessId String   @db.Uuid
+  name       String   @db.VarChar(80)
+  nameHindi  String?  @db.VarChar(80)
+  isSystem   Boolean  @default(false) // seeded defaults: Labour, Transport, Electricity, Rent …
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  expenses Expense[]
+
+  @@unique([businessId, id])
+  @@unique([businessId, name])
+}
+
+model Expense {
+  id              String      @id @default(uuid(7)) @db.Uuid
+  businessId      String      @db.Uuid
+  expenseNumber   String      @db.VarChar(30)
+  categoryId      String      @db.Uuid
+  expenseDate     DateTime    @db.Date
+  amount          Decimal     @db.Decimal(14, 2)
+  mode            PaymentMode @default(CASH)
+  payee           String?     @db.VarChar(120)
+  referenceNumber String?     @db.VarChar(60)
+  remarks         String?     @db.VarChar(300)
+  billId          String?     @db.Uuid
+  status          TxnStatus   @default(ACTIVE)
+  cancelledAt     DateTime?   @db.Timestamptz(3)
+  cancelReason    String?
+  createdById     String      @db.Uuid
+  createdAt       DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime    @updatedAt @db.Timestamptz(3)
+
+  business  Business        @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  category  ExpenseCategory @relation(fields: [businessId, categoryId], references: [businessId, id], onDelete: Restrict)
+  bill      Attachment?     @relation(fields: [billId], references: [id], onDelete: SetNull)
+  createdBy User            @relation("ExpenseCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([businessId, expenseNumber])
+  @@index([businessId, expenseDate])
+  @@index([businessId, categoryId, expenseDate])
+}
+
+// -----------------------------------------------------------------------------
+// PLATFORM PLUMBING: SEQUENCES, IDEMPOTENCY, APPROVALS, AUDIT
+// -----------------------------------------------------------------------------
+
+/// Gap-free per-tenant document numbering, incremented with SELECT … FOR UPDATE inside the txn.
+model DocumentSequence {
+  businessId String   @db.Uuid
+  docType    DocType
+  fiscalYear String   @db.VarChar(7) // "2026-27", or "ALL" for masters
+  prefix     String   @db.VarChar(10)
+  nextValue  Int      @default(1)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@id([businessId, docType, fiscalYear])
+}
+
+/// Generic replay protection for mutating POSTs (Idempotency-Key header).
+model IdempotencyRecord {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  businessId     String   @db.Uuid
+  userId         String   @db.Uuid
+  key            String   @db.VarChar(64)
+  method         String   @db.VarChar(10)
+  path           String   @db.VarChar(200)
+  requestHash    String   @db.VarChar(64) // same key + different body ⇒ 422
+  responseStatus Int?
+  responseBody   Json?
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  expiresAt      DateTime @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, key])
+  @@index([expiresAt])
+}
+
+model ApprovalRequest {
+  id            String         @id @default(uuid(7)) @db.Uuid
+  businessId    String         @db.Uuid
+  entityType    String         @db.VarChar(40) // "Sale", "Payment", "Patti" …
+  entityId      String         @db.Uuid
+  action        ApprovalAction
+  reason        String         @db.VarChar(500)
+  payload       Json? // proposed change for EDIT / LEDGER_ADJUSTMENT
+  status        ApprovalStatus @default(PENDING)
+  requestedById String         @db.Uuid
+  decidedById   String?        @db.Uuid
+  decidedAt     DateTime?      @db.Timestamptz(3)
+  decisionNote  String?        @db.VarChar(500)
+  createdAt     DateTime       @default(now()) @db.Timestamptz(3)
+
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  requestedBy User     @relation("ApprovalRequestedBy", fields: [requestedById], references: [id], onDelete: Restrict)
+  decidedBy   User?    @relation("ApprovalDecidedBy", fields: [decidedById], references: [id], onDelete: Restrict)
+
+  @@index([businessId, status])
+  @@index([businessId, entityType, entityId])
+}
+
+/// Immutable record of every data change (who / what / before / after).
+model AuditLog {
+  id          String      @id @default(uuid(7)) @db.Uuid
+  businessId  String?     @db.Uuid // null for platform-level (super admin) actions
+  actorUserId String?     @db.Uuid
+  action      AuditAction
+  entityType  String      @db.VarChar(40)
+  entityId    String      @db.Uuid
+  before      Json?
+  after       Json?
+  requestId   String?     @db.VarChar(64)
+  ipAddress   String?     @db.VarChar(45)
+  userAgent   String?     @db.VarChar(300)
+  createdAt   DateTime    @default(now()) @db.Timestamptz(3)
+
+  business Business? @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  actor    User?     @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([businessId, entityType, entityId])
+  @@index([businessId, createdAt])
+  @@index([actorUserId, createdAt])
+}
+
+/// Non-data events: logins, exports, shares. Powers "login history".
+model StaffActivity {
+  id           String       @id @default(uuid(7)) @db.Uuid
+  businessId   String?      @db.Uuid
+  userId       String?      @db.Uuid // null when login failed for unknown mobile
+  activityType ActivityType
+  metadata     Json?
+  ipAddress    String?      @db.VarChar(45)
+  userAgent    String?      @db.VarChar(300)
+  createdAt    DateTime     @default(now()) @db.Timestamptz(3)
+
+  business Business? @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([businessId, createdAt])
+  @@index([userId, createdAt])
+}
+
+// -----------------------------------------------------------------------------
+// SUBSCRIPTIONS & BILLING
+// -----------------------------------------------------------------------------
+
+model SubscriptionPlan {
+  id                  String   @id @default(uuid(7)) @db.Uuid
+  code                String   @unique @db.VarChar(30) // STARTER | PROFESSIONAL | BUSINESS
+  name                String   @db.VarChar(60)
+  nameHindi           String?  @db.VarChar(60)
+  priceMonthly        Decimal  @db.Decimal(10, 2)
+  currency            String   @default("INR") @db.VarChar(3)
+  trialDays           Int      @default(14)
+  maxStaffUsers       Int? // null = unlimited
+  maxFarmers          Int?
+  maxMonthlyAiQueries Int      @default(0)
+  aiEnabled           Boolean  @default(false)
+  whatsappEnabled     Boolean  @default(false)
+  exportsEnabled      Boolean  @default(true)
+  isActive            Boolean  @default(true)
+  sortOrder           Int      @default(0)
+  createdAt           DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt           DateTime @updatedAt @db.Timestamptz(3)
+
+  subscriptions        Subscription[] @relation("CurrentPlan")
+  pendingSubscriptions Subscription[] @relation("PendingPlan")
+  billingPayments      BillingPayment[]
+}
+
+model Subscription {
+  id                 String             @id @default(uuid(7)) @db.Uuid
+  businessId         String             @unique @db.Uuid
+  planId             String             @db.Uuid
+  status             SubscriptionStatus @default(TRIALING)
+  trialEndsAt        DateTime?          @db.Timestamptz(3)
+  currentPeriodStart DateTime?          @db.Timestamptz(3)
+  currentPeriodEnd   DateTime?          @db.Timestamptz(3) // = renewal date
+  cancelAtPeriodEnd  Boolean            @default(false)
+  pendingPlanId      String?            @db.Uuid // downgrade applied at period end
+  createdAt          DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime           @updatedAt @db.Timestamptz(3)
+
+  business    Business            @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  plan        SubscriptionPlan    @relation("CurrentPlan", fields: [planId], references: [id], onDelete: Restrict)
+  pendingPlan SubscriptionPlan?   @relation("PendingPlan", fields: [pendingPlanId], references: [id], onDelete: SetNull)
+  events      SubscriptionEvent[]
+  payments    BillingPayment[]
+
+  @@index([status, currentPeriodEnd])
+}
+
+model SubscriptionEvent {
+  id             String              @id @default(uuid(7)) @db.Uuid
+  businessId     String              @db.Uuid
+  subscriptionId String              @db.Uuid
+  eventType      String              @db.VarChar(40) // TRIAL_STARTED, UPGRADED, RENEWED, EXPIRED …
+  fromStatus     SubscriptionStatus?
+  toStatus       SubscriptionStatus?
+  fromPlanCode   String?             @db.VarChar(30)
+  toPlanCode     String?             @db.VarChar(30)
+  actorUserId    String?             @db.Uuid
+  metadata       Json?
+  createdAt      DateTime            @default(now()) @db.Timestamptz(3)
+
+  business     Business     @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, createdAt])
+}
+
+/// Payment to the SaaS platform (not mandi money). Status becomes SUCCEEDED only after
+/// server-side signature verification / verified webhook — never on client say-so.
+model BillingPayment {
+  id               String               @id @default(uuid(7)) @db.Uuid
+  businessId       String               @db.Uuid
+  subscriptionId   String               @db.Uuid
+  planId           String               @db.Uuid
+  amount           Decimal              @db.Decimal(10, 2)
+  currency         String               @default("INR") @db.VarChar(3)
+  gateway          String               @default("RAZORPAY") @db.VarChar(20)
+  gatewayOrderId   String               @unique @db.VarChar(100)
+  gatewayPaymentId String?              @unique @db.VarChar(100)
+  status           BillingPaymentStatus @default(CREATED)
+  verifiedAt       DateTime?            @db.Timestamptz(3)
+  periodStart      DateTime?            @db.Timestamptz(3)
+  periodEnd        DateTime?            @db.Timestamptz(3)
+  failureReason    String?              @db.VarChar(300)
+  createdAt        DateTime             @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime             @updatedAt @db.Timestamptz(3)
+
+  business     Business         @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  subscription Subscription     @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  plan         SubscriptionPlan @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@index([businessId, createdAt])
+}
+
+/// De-duplicates inbound webhooks (payment gateway, WhatsApp status callbacks).
+model WebhookEvent {
+  id          String    @id @default(uuid(7)) @db.Uuid
+  provider    String    @db.VarChar(20)
+  eventId     String    @db.VarChar(120)
+  eventType   String    @db.VarChar(80)
+  payload     Json
+  receivedAt  DateTime  @default(now()) @db.Timestamptz(3)
+  processedAt DateTime? @db.Timestamptz(3)
+  error       String?
+
+  @@unique([provider, eventId])
+}
+
+// -----------------------------------------------------------------------------
+// NOTIFICATIONS, WHATSAPP, FILES
+// -----------------------------------------------------------------------------
+
+model Notification {
+  id         String    @id @default(uuid(7)) @db.Uuid
+  businessId String    @db.Uuid
+  userId     String    @db.Uuid
+  type       String    @db.VarChar(40) // PAYMENT_DUE, APPROVAL_PENDING, SUBSCRIPTION_EXPIRING …
+  title      String    @db.VarChar(150)
+  body       String?   @db.VarChar(500)
+  link       String?   @db.VarChar(300)
+  readAt     DateTime? @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, businessId, readAt])
+}
+
+model WhatsAppMessage {
+  id                String        @id @default(uuid(7)) @db.Uuid
+  businessId        String        @db.Uuid
+  farmerId          String?       @db.Uuid
+  buyerId           String?       @db.Uuid
+  toMobile          String        @db.VarChar(15)
+  templateName      String        @db.VarChar(100)
+  templateLanguage  String        @default("hi") @db.VarChar(10)
+  variables         Json
+  mediaId           String?       @db.Uuid
+  relatedEntityType String?       @db.VarChar(40)
+  relatedEntityId   String?       @db.Uuid
+  status            MessageStatus @default(QUEUED)
+  providerMessageId String?       @unique @db.VarChar(120)
+  errorCode         String?       @db.VarChar(40)
+  errorMessage      String?       @db.VarChar(300)
+  sentAt            DateTime?     @db.Timestamptz(3)
+  deliveredAt       DateTime?     @db.Timestamptz(3)
+  readAt            DateTime?     @db.Timestamptz(3)
+  createdById       String        @db.Uuid
+  createdAt         DateTime      @default(now()) @db.Timestamptz(3)
+
+  business  Business    @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  farmer    Farmer?     @relation(fields: [farmerId], references: [id], onDelete: SetNull)
+  buyer     Buyer?      @relation(fields: [buyerId], references: [id], onDelete: SetNull)
+  media     Attachment? @relation(fields: [mediaId], references: [id], onDelete: SetNull)
+  createdBy User        @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([businessId, createdAt])
+  @@index([businessId, status])
+}
+
+model Attachment {
+  id           String            @id @default(uuid(7)) @db.Uuid
+  businessId   String            @db.Uuid
+  purpose      AttachmentPurpose
+  storageKey   String            @unique @db.VarChar(300) // object-storage key: {businessId}/{purpose}/{uuid}
+  fileName     String            @db.VarChar(200)
+  mimeType     String            @db.VarChar(100)
+  sizeBytes    Int
+  sha256       String            @db.VarChar(64)
+  uploadedById String            @db.Uuid
+  createdAt    DateTime          @default(now()) @db.Timestamptz(3)
+
+  business   Business          @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  uploadedBy User              @relation(fields: [uploadedById], references: [id], onDelete: Restrict)
+  pattis     Patti[]
+  payments   Payment[]
+  expenses   Expense[]
+  messages   WhatsAppMessage[]
+  aiMessages AiMessage[]
+
+  @@index([businessId, purpose])
+}
+
+// -----------------------------------------------------------------------------
+// AI ASSISTANT
+// -----------------------------------------------------------------------------
+
+model AiConversation {
+  id         String    @id @default(uuid(7)) @db.Uuid
+  businessId String    @db.Uuid
+  userId     String    @db.Uuid
+  title      String?   @db.VarChar(150)
+  archivedAt DateTime? @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime  @updatedAt @db.Timestamptz(3)
+
+  business Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages AiMessage[]
+  drafts   AiDraft[]
+
+  @@index([businessId, userId, updatedAt])
+}
+
+model AiMessage {
+  id             String      @id @default(uuid(7)) @db.Uuid
+  businessId     String      @db.Uuid
+  conversationId String      @db.Uuid
+  role           AiRole
+  inputMode      AiInputMode @default(TEXT)
+  content        String
+  attachmentId   String?     @db.Uuid
+  toolCalls      Json? // read-only tool invocations + results (for audit/debug)
+  model          String?     @db.VarChar(60)
+  inputTokens    Int?
+  outputTokens   Int?
+  createdAt      DateTime    @default(now()) @db.Timestamptz(3)
+
+  business     Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  conversation AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  attachment   Attachment?    @relation(fields: [attachmentId], references: [id], onDelete: SetNull)
+  drafts       AiDraft[]
+
+  @@index([conversationId, createdAt])
+  @@index([businessId, createdAt]) // monthly AI quota counting
+}
+
+/// AI output that *could* become a transaction. Nothing financial happens until a human
+/// confirms it, at which point the normal validated service (not the AI) creates the record.
+model AiDraft {
+  id                  String        @id @default(uuid(7)) @db.Uuid
+  businessId          String        @db.Uuid
+  userId              String        @db.Uuid
+  conversationId      String?       @db.Uuid
+  messageId           String?       @db.Uuid
+  draftType           AiDraftType
+  payload             Json // extracted fields, validated against the same Zod schema as the manual form
+  status              AiDraftStatus @default(PENDING)
+  confirmedEntityType String?       @db.VarChar(40)
+  confirmedEntityId   String?       @db.Uuid
+  confirmedAt         DateTime?     @db.Timestamptz(3)
+  expiresAt           DateTime      @db.Timestamptz(3)
+  createdAt           DateTime      @default(now()) @db.Timestamptz(3)
+
+  business     Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user         User            @relation("AiDraftOwner", fields: [userId], references: [id], onDelete: Cascade)
+  conversation AiConversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  message      AiMessage?      @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@index([businessId, userId, status])
+}
